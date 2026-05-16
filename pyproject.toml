@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "brost-common"
+version = "0.1.0"
+description = "Shared utilities for Brost family Django apps"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.28"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["brost_common*"]
