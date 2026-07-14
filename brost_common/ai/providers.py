@@ -235,7 +235,17 @@ class OpenAICompatProvider(BaseProvider):
 
 
 class AzureProvider(BaseProvider):
-    """Azure OpenAI — deployment-based URL, api-key header auth."""
+    """Azure OpenAI — deployment-based URL, api-key header auth.
+
+    Supports both the legacy Chat Completions API and the newer Responses API
+    (required for GPT-5.5 and later models on Azure AI Foundry).
+
+    Responses API is used when:
+      - azure_base_url already contains '/openai/v1'  (user sets the Foundry endpoint directly), OR
+      - the deployment name contains 'gpt-5.5'
+
+    Chat Completions API is used for all other deployments.
+    """
 
     def __init__(self, config: dict):
         self.config = config
@@ -248,18 +258,30 @@ class AzureProvider(BaseProvider):
         self.deployment = config.get('azure_deployment', '')
         self.api_version = config.get('azure_api_version') or '2024-02-15-preview'
 
+    def _use_responses_api(self) -> bool:
+        return (
+            '/openai/v1' in self.azure_base
+            or 'gpt-5.5' in self.deployment.lower()
+            or 'gpt-5.5' in self.model.lower()
+        )
+
     def chat(self, messages, *, tools=None, temperature=0.7, max_tokens=4096) -> ChatResponse:
         if not self.azure_base:
             raise ValueError("AzureProvider requires azure_base_url in config")
         if not self.deployment:
             raise ValueError("AzureProvider requires azure_deployment in config")
 
+        if self._use_responses_api():
+            return self._chat_responses(messages, tools=tools, max_tokens=max_tokens)
+        return self._chat_completions(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+
+    def _chat_completions(self, messages, *, tools=None, temperature=0.7, max_tokens=4096) -> ChatResponse:
+        """Legacy Chat Completions API — all models except GPT-5.5+."""
         url = (
             f"{self.azure_base}/openai/deployments/{self.deployment}"
             f"/chat/completions?api-version={self.api_version}"
         )
 
-        # o1 and GPT-5 series: max_completion_tokens + no temperature
         d_lower = self.deployment.lower()
         m_lower = self.model.lower()
         is_o1 = 'o1' in d_lower or 'o1' in m_lower
@@ -302,6 +324,74 @@ class AzureProvider(BaseProvider):
             raw=data,
             model=data.get('model', self.deployment),
             duration_ms=int((time.time() - start) * 1000),
+        )
+
+    def _chat_responses(self, messages, *, tools=None, max_tokens=4096) -> ChatResponse:
+        """Responses API — required for GPT-5.5+ on Azure AI Foundry.
+
+        URL shape:  {base}/openai/v1/responses
+        If azure_base already ends with /openai/v1 we append /responses directly;
+        otherwise we insert /openai/v1/responses after the host.
+        """
+        if '/openai/v1' in self.azure_base:
+            # User already included the /openai/v1 path segment
+            base = self.azure_base.rstrip('/')
+            url = f"{base}/responses"
+        else:
+            url = f"{self.azure_base}/openai/v1/responses"
+
+        # Responses API: system messages go in the 'instructions' param; everything
+        # else goes in 'input' as-is (role/content dicts are accepted directly).
+        system_parts = [m['content'] for m in messages if m.get('role') == 'system']
+        input_messages = [m for m in messages if m.get('role') != 'system']
+
+        body: dict[str, Any] = {
+            'model': self.deployment,
+            'input': input_messages,
+            'max_output_tokens': max_tokens,
+        }
+        if system_parts:
+            body['instructions'] = '\n'.join(str(p) for p in system_parts)
+        if tools:
+            body['tools'] = tools
+
+        headers = {'Content-Type': 'application/json', 'api-key': self.api_key}
+
+        start = time.time()
+        resp = requests.post(url, json=body, headers=headers, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        duration_ms = int((time.time() - start) * 1000)
+
+        # Parse output items — text and tool calls have different item types.
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        for item in data.get('output', []):
+            item_type = item.get('type')
+            if item_type == 'message':
+                for block in item.get('content', []):
+                    if block.get('type') == 'output_text':
+                        text_parts.append(block.get('text', ''))
+            elif item_type == 'function_call':
+                args_raw = item.get('arguments', '{}')
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except json.JSONDecodeError:
+                    args = {'_raw': args_raw}
+                tool_calls.append(ToolCall(
+                    id=item.get('call_id', item.get('id', '')),
+                    name=item.get('name', ''),
+                    arguments=args,
+                ))
+
+        finish = 'tool_calls' if tool_calls and not text_parts else 'stop'
+        return ChatResponse(
+            content=''.join(text_parts) or None,
+            tool_calls=tool_calls,
+            finish_reason=finish,
+            raw=data,
+            model=data.get('model', self.deployment),
+            duration_ms=duration_ms,
         )
 
 
