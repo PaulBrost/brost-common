@@ -2,9 +2,9 @@
 LLM provider implementations for the Brost common library.
 
 All providers expose a uniform chat(messages, **opts) -> ChatResponse interface.
-Provider-specific quirks (Anthropic system-prompt placement, Azure deployment
-URLs, GPT-5/o1 parameter naming) are isolated here so callers stay
-provider-agnostic.
+Provider-specific quirks (Anthropic system-prompt placement and current-gen
+sampling-parameter omission, Azure deployment URLs, GPT-5/o1 parameter
+naming) are isolated here so callers stay provider-agnostic.
 """
 from __future__ import annotations
 
@@ -24,6 +24,13 @@ def _uses_completion_tokens(model: str) -> bool:
     """True for models that require max_completion_tokens instead of max_tokens."""
     m = model.lower()
     return m.startswith('o1') or '-o1' in m or 'gpt-5' in m
+
+
+def _anthropic_omits_sampling(model: str) -> bool:
+    """Opus 4.7+, Sonnet 5, and Fable 5 / Mythos 5 reject temperature/top_p/top_k
+    (HTTP 400). Older Claude models still accept them."""
+    m = model.lower()
+    return any(tok in m for tok in ('opus-4-7', 'opus-4-8', 'sonnet-5', 'fable-5', 'mythos-5'))
 
 
 class BaseProvider:
@@ -87,9 +94,10 @@ class AnthropicProvider(BaseProvider):
         body: dict[str, Any] = {
             'model': self.model or 'claude-sonnet-4-6',
             'max_tokens': max_tokens,
-            'temperature': temperature,
             'messages': api_messages,
         }
+        if not _anthropic_omits_sampling(body['model']):
+            body['temperature'] = temperature
         if system_text.strip():
             body['system'] = system_text.strip()
         if tools:
