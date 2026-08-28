@@ -23,6 +23,7 @@ def call_llm(
     tools=None,
     temperature: float = 0.7,
     max_tokens: int = 4096,
+    tool_choice=None,
 ) -> ChatResponse:
     """
     Call an LLM using a duck-typed profile object.
@@ -30,6 +31,15 @@ def call_llm(
     profile must have a 'provider' attribute ('openai', 'anthropic', 'azure', or 'stub').
     Reads api_key, model, base_url, azure_base_url / azure_endpoint,
     azure_deployment, azure_api_version via getattr with empty-string defaults.
+
+    tools are passed in the OpenAI chat-completions shape
+    ({'type': 'function', 'function': {'name', 'description', 'parameters'}});
+    each provider translates that to its own API's shape.
+
+    tool_choice is optional and takes the OpenAI values -- 'auto', 'required',
+    'none', or {'type': 'function', 'function': {'name': 'x'}} to force one
+    named tool. Omitted by default, so the request body is unchanged for
+    callers that do not use it.
     """
     provider_type = getattr(profile, 'provider', 'stub')
     config = {
@@ -47,7 +57,13 @@ def call_llm(
     cls = _PROVIDER_MAP.get(provider_type)
     if cls is None:
         return MockProvider(config).chat(messages)
-    return cls(config).chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+    return cls(config).chat(
+        messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
 
 
 # Alias kept for backward compatibility with site_ai callers

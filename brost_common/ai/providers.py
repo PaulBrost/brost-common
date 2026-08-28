@@ -4,7 +4,12 @@ LLM provider implementations for the Brost common library.
 All providers expose a uniform chat(messages, **opts) -> ChatResponse interface.
 Provider-specific quirks (Anthropic system-prompt placement and current-gen
 sampling-parameter omission, Azure deployment URLs, GPT-5/o1 parameter
-naming) are isolated here so callers stay provider-agnostic.
+naming, Responses-API tool shape) are isolated here so callers stay
+provider-agnostic.
+
+Callers always pass tools and tool_choice in the OpenAI chat-completions
+shape. Each provider translates them; a caller never has to know which API
+its deployment speaks.
 """
 from __future__ import annotations
 
@@ -33,6 +38,101 @@ def _anthropic_omits_sampling(model: str) -> bool:
     return any(tok in m for tok in ('opus-4-7', 'opus-4-8', 'sonnet-5', 'fable-5', 'mythos-5'))
 
 
+# --- Tool-definition shape translation -------------------------------------
+#
+# Callers of this library always pass tools in the OpenAI chat-completions
+# shape:  {'type': 'function', 'function': {'name', 'description', 'parameters'}}
+# Each provider translates that into whatever its own API wants, so a caller
+# never has to know which API its deployment happens to speak.
+
+
+def _responses_tool(tool: Any) -> dict[str, Any]:
+    """Translate one tool definition into the Responses API shape.
+
+    The Responses API wants function tools *flat* --
+    ``{'type': 'function', 'name': ..., 'description': ..., 'parameters': {...}}``
+    -- where chat completions nests those fields under a ``function`` key.
+
+    Every key the nested ``function`` object carries is hoisted, so
+    ``description``, ``parameters`` and extras such as ``strict`` survive.
+
+    Tools that carry no ``function`` key are returned untouched. That covers
+    both an already-flat definition (making the translation idempotent) and the
+    Responses API's built-in tool types, e.g. ``{'type': 'web_search'}``, which
+    this library must not gatekeep.
+
+    Raises ValueError on a malformed definition -- one that could not be valid
+    under either API. See the module note in the README on why this raises.
+    """
+    if not isinstance(tool, dict):
+        raise ValueError(
+            f"tool definition must be a dict, got {type(tool).__name__}"
+        )
+
+    fn = tool.get('function')
+    if fn is None:
+        return tool
+    if not isinstance(fn, dict):
+        raise ValueError(
+            f"tool['function'] must be a dict, got {type(fn).__name__}"
+        )
+
+    flat = {k: v for k, v in tool.items() if k != 'function'}
+    flat.update(fn)
+    flat['type'] = 'function'
+    if not flat.get('name'):
+        raise ValueError("function tool definition is missing 'name'")
+    return flat
+
+
+_ANTHROPIC_TOOL_CHOICE = {
+    'auto': {'type': 'auto'},
+    'required': {'type': 'any'},
+    'none': {'type': 'none'},
+}
+
+
+def _anthropic_tool_choice(tool_choice: Any) -> Any:
+    """Translate an OpenAI-shaped tool_choice into Anthropic's shape.
+
+    'auto' -> {'type': 'auto'},  'required' -> {'type': 'any'},
+    'none' -> {'type': 'none'},
+    {'type': 'function', 'function': {'name': 'x'}} -> {'type': 'tool', 'name': 'x'}
+
+    A dict that is already Anthropic-shaped is passed through unchanged.
+    """
+    if isinstance(tool_choice, str):
+        try:
+            return _ANTHROPIC_TOOL_CHOICE[tool_choice]
+        except KeyError:
+            raise ValueError(
+                f"unsupported tool_choice {tool_choice!r}; expected 'auto', "
+                "'required', 'none', or a named-function dict"
+            ) from None
+    if isinstance(tool_choice, dict):
+        if tool_choice.get('type') == 'function':
+            name = (tool_choice.get('function') or tool_choice).get('name')
+            if not name:
+                raise ValueError("named tool_choice is missing 'name'")
+            return {'type': 'tool', 'name': name}
+        return tool_choice
+    raise ValueError(
+        f"tool_choice must be a str or dict, got {type(tool_choice).__name__}"
+    )
+
+
+def _responses_tool_choice(tool_choice: Any) -> Any:
+    """Translate a tool_choice into the Responses API shape.
+
+    The string forms ('auto', 'required', 'none') are identical in both APIs.
+    A named-function choice needs the same hoist as a tool definition:
+    {'type': 'function', 'function': {'name': 'x'}} -> {'type': 'function', 'name': 'x'}
+    """
+    if isinstance(tool_choice, dict):
+        return _responses_tool(tool_choice)
+    return tool_choice
+
+
 class BaseProvider:
     """Abstract base. Subclasses must implement chat()."""
 
@@ -44,7 +144,8 @@ class BaseProvider:
         self.api_key = config.get('api_key', '')
         self.base_url = (config.get('base_url') or self.default_base_url).rstrip('/') + '/'
 
-    def chat(self, messages: list[dict], *, tools=None, temperature=0.7, max_tokens=4096) -> ChatResponse:
+    def chat(self, messages: list[dict], *, tools=None, tool_choice=None,
+             temperature=0.7, max_tokens=4096) -> ChatResponse:
         raise NotImplementedError
 
     def health_check(self) -> bool:
@@ -58,7 +159,8 @@ class BaseProvider:
 class AnthropicProvider(BaseProvider):
     default_base_url = 'https://api.anthropic.com/v1/'
 
-    def chat(self, messages, *, tools=None, temperature=0.7, max_tokens=4096) -> ChatResponse:
+    def chat(self, messages, *, tools=None, tool_choice=None, temperature=0.7,
+             max_tokens=4096) -> ChatResponse:
         # Anthropic: system prompt goes top-level, not in the messages array.
         # Tool-call schema is also different from OpenAI format.
         system_text = ''
@@ -109,6 +211,8 @@ class AnthropicProvider(BaseProvider):
                 }
                 for t in tools
             ]
+        if tool_choice is not None:
+            body['tool_choice'] = _anthropic_tool_choice(tool_choice)
 
         url = self.base_url + 'messages'
         headers = {
@@ -171,7 +275,8 @@ class OpenAICompatProvider(BaseProvider):
 
     default_base_url = 'https://api.openai.com/v1/'
 
-    def chat(self, messages, *, tools=None, temperature=0.7, max_tokens=4096) -> ChatResponse:
+    def chat(self, messages, *, tools=None, tool_choice=None, temperature=0.7,
+             max_tokens=4096) -> ChatResponse:
         model = self.model or 'gpt-4o-mini'
         new_style = _uses_completion_tokens(model)
 
@@ -181,6 +286,8 @@ class OpenAICompatProvider(BaseProvider):
         body['max_completion_tokens' if new_style else 'max_tokens'] = max_tokens
         if tools:
             body['tools'] = tools
+        if tool_choice is not None:
+            body['tool_choice'] = tool_choice
 
         url = self.base_url + 'chat/completions'
         headers = {
@@ -245,6 +352,10 @@ class AzureProvider(BaseProvider):
       - the deployment name contains 'gpt-5.5'
 
     Chat Completions API is used for all other deployments.
+
+    The two APIs disagree on the tool-definition shape -- chat completions
+    nests the function fields under a 'function' key, the Responses API wants
+    them flat -- so _chat_responses translates them via _responses_tool().
     """
 
     def __init__(self, config: dict):
@@ -265,17 +376,24 @@ class AzureProvider(BaseProvider):
             or 'gpt-5.5' in self.model.lower()
         )
 
-    def chat(self, messages, *, tools=None, temperature=0.7, max_tokens=4096) -> ChatResponse:
+    def chat(self, messages, *, tools=None, tool_choice=None, temperature=0.7,
+             max_tokens=4096) -> ChatResponse:
         if not self.azure_base:
             raise ValueError("AzureProvider requires azure_base_url in config")
         if not self.deployment:
             raise ValueError("AzureProvider requires azure_deployment in config")
 
         if self._use_responses_api():
-            return self._chat_responses(messages, tools=tools, max_tokens=max_tokens)
-        return self._chat_completions(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+            return self._chat_responses(
+                messages, tools=tools, tool_choice=tool_choice, max_tokens=max_tokens
+            )
+        return self._chat_completions(
+            messages, tools=tools, tool_choice=tool_choice,
+            temperature=temperature, max_tokens=max_tokens,
+        )
 
-    def _chat_completions(self, messages, *, tools=None, temperature=0.7, max_tokens=4096) -> ChatResponse:
+    def _chat_completions(self, messages, *, tools=None, tool_choice=None,
+                          temperature=0.7, max_tokens=4096) -> ChatResponse:
         """Legacy Chat Completions API — all models except GPT-5.5+."""
         url = (
             f"{self.azure_base}/openai/deployments/{self.deployment}"
@@ -293,6 +411,8 @@ class AzureProvider(BaseProvider):
         body['max_completion_tokens' if new_style else 'max_tokens'] = max_tokens
         if tools:
             body['tools'] = tools
+        if tool_choice is not None:
+            body['tool_choice'] = tool_choice
 
         headers = {'Content-Type': 'application/json', 'api-key': self.api_key}
 
@@ -326,7 +446,8 @@ class AzureProvider(BaseProvider):
             duration_ms=int((time.time() - start) * 1000),
         )
 
-    def _chat_responses(self, messages, *, tools=None, max_tokens=4096) -> ChatResponse:
+    def _chat_responses(self, messages, *, tools=None, tool_choice=None,
+                        max_tokens=4096) -> ChatResponse:
         """Responses API — required for GPT-5.5+ on Azure AI Foundry.
 
         URL shape:  {base}/openai/v1/responses
@@ -353,7 +474,12 @@ class AzureProvider(BaseProvider):
         if system_parts:
             body['instructions'] = '\n'.join(str(p) for p in system_parts)
         if tools:
-            body['tools'] = tools
+            # The Responses API wants function tools flat; callers pass the
+            # nested chat-completions shape. Translate here so the caller never
+            # has to know which Azure API its deployment speaks.
+            body['tools'] = [_responses_tool(t) for t in tools]
+        if tool_choice is not None:
+            body['tool_choice'] = _responses_tool_choice(tool_choice)
 
         headers = {'Content-Type': 'application/json', 'api-key': self.api_key}
 
@@ -398,7 +524,8 @@ class AzureProvider(BaseProvider):
 class MockProvider(BaseProvider):
     default_base_url = 'http://mock.invalid/'
 
-    def chat(self, messages, *, tools=None, temperature=0.7, max_tokens=4096) -> ChatResponse:
+    def chat(self, messages, *, tools=None, tool_choice=None, temperature=0.7,
+             max_tokens=4096) -> ChatResponse:
         last_user = next(
             (m['content'] for m in reversed(messages) if m.get('role') == 'user'), ''
         )
